@@ -9,7 +9,6 @@ This file was produced almost in its entirety, verbatim, by (Anthropic) Claude.
 Use of this source code is governed by an MIT-style license that can be
 found in the LICENSE file or at https://opensource.org/licenses/MIT.
 
-
 Usage:
     python3 hf_to_weed.py --model_dir <path_to_hf_model> --output <output.weed>
     python3 hf_to_weed.py --model_dir <path_to_hf_model> --output <output.weed> --arch gpt2
@@ -120,7 +119,9 @@ def write_storage(f, arr: np.ndarray):
 # Matches Parameter::save(): offset | ndim | (shape,stride)* | storage
 # Strides are C-contiguous (row-major).
 # ---------------------------------------------------------------------------
-def write_parameter(f, arr: np.ndarray, offset: int = 0):
+DEBUG = False  # set to True to print file offsets for each parameter written
+
+def write_parameter(f, arr: np.ndarray, offset: int = 0, label: str = ''):
     # Weed uses column-major (Fortran) strides: stride[0]=1, stride[i]=prod(shape[:i])
     # This matches the stride computation in forward_int exactly.
     arr_f = np.asfortranarray(arr.astype(np.float32))
@@ -129,6 +130,9 @@ def write_parameter(f, arr: np.ndarray, offset: int = 0):
     strides = [1] * ndim
     for i in range(1, ndim):
         strides[i] = strides[i - 1] * shape[i - 1]
+
+    if DEBUG:
+        print(f"  PARAM @{f.tell():>10d}  shape={shape}  strides={strides}  {label}")
 
     write_tcapint(f, offset)
     write_tcapint(f, ndim)
@@ -140,57 +144,72 @@ def write_parameter(f, arr: np.ndarray, offset: int = 0):
 # ---------------------------------------------------------------------------
 # Module writers — one function per ModuleType used in conversion
 # ---------------------------------------------------------------------------
-def write_linear(f, weight: np.ndarray, bias=None):
+def write_linear(f, weight: np.ndarray, bias=None, label=''):
     """weight from HF: (out_features, in_features) — Weed expects (in_features, out_features)."""
     weight = weight.T   # (in_features, out_features)
     in_f, out_f = weight.shape
+    if DEBUG:
+        print(f" LINEAR @{f.tell():>10d}  in={in_f} out={out_f}  {label}")
     write_module_type(f, ModuleType.LINEAR_T)
     write_tcapint(f, in_f)
     write_tcapint(f, out_f)
-    write_parameter(f, weight)
+    write_parameter(f, weight, label=f'{label}.weight')
     has_bias = bias is not None
     write_bool(f, has_bias)
     if has_bias:
-        write_parameter(f, bias)
+        write_parameter(f, bias, label=f'{label}.bias')
 
-def write_layernorm(f, gamma: np.ndarray, beta: np.ndarray, eps: float = 1e-5):
+def write_layernorm(f, gamma: np.ndarray, beta: np.ndarray, eps: float = 1e-5, label=''):
     features = gamma.shape[0]
+    if DEBUG:
+        print(f" LAYERNORM @{f.tell():>10d}  features={features}  {label}")
     write_module_type(f, ModuleType.LAYERNORM_T)
     write_tcapint(f, features)
     write_real(f, eps)
-    write_parameter(f, gamma)
-    write_parameter(f, beta)
+    write_parameter(f, gamma, label=f'{label}.gamma')
+    write_parameter(f, beta,  label=f'{label}.beta')
 
 def write_gelu(f):
     write_module_type(f, ModuleType.GELU_T)
 
-def write_embedding(f, weight: np.ndarray):
+def write_embedding(f, weight: np.ndarray, label=''):
     """weight shape: (num_embeddings, embedding_dim)"""
     num_emb, emb_dim = weight.shape
+    if DEBUG:
+        print(f" EMBEDDING @{f.tell():>10d}  num_emb={num_emb} emb_dim={emb_dim}  {label}")
     write_module_type(f, ModuleType.EMBEDDING_T)
     write_tcapint(f, num_emb)
     write_tcapint(f, emb_dim)
-    write_parameter(f, weight)
+    write_parameter(f, weight, label=f'{label}.weight')
 
-def write_learned_positional_encoding(f, weight: np.ndarray):
-    """weight shape: (max_len, d_model)"""
+def write_learned_positional_encoding(f, weight: np.ndarray, label=''):
+    """
+    weight from HF: (max_len, d_model)
+    Weed stores pos_encoding as shape [1, max_len, d_model] (3D) with
+    column-major strides [1, 1, max_len] — matching LearnedPositionalEncoding
+    constructor: Parameter(init, {1U, max_len, d_model}, dtag)
+    """
     max_len, d_model = weight.shape
+    if DEBUG:
+        print(f" LEARNEDPOS @{f.tell():>10d}  max_len={max_len} d_model={d_model}  {label}")
     write_module_type(f, ModuleType.LEARNED_POSITIONAL_ENCODING_T)
     write_tcapint(f, max_len)
     write_tcapint(f, d_model)
-    write_parameter(f, weight)
+    # Reshape to [1, max_len, d_model] to match Weed's internal representation
+    weight_3d = weight.reshape(1, max_len, d_model)
+    write_parameter(f, weight_3d, label=f'{label}.weight')
 
 def write_multihead_attention(f, W_q, b_q, W_k, b_k, W_v, b_v, W_o, b_o,
-                               d_model, num_heads):
+                               d_model, num_heads, label='attn'):
     head_dim = d_model // num_heads
     write_module_type(f, ModuleType.MULTIHEAD_ATTENTION_T)
     write_symint(f, d_model)
     write_symint(f, num_heads)
     write_symint(f, head_dim)
-    write_linear(f, W_q, b_q)
-    write_linear(f, W_k, b_k)
-    write_linear(f, W_v, b_v)
-    write_linear(f, W_o, b_o)
+    write_linear(f, W_q, b_q, label=f'{label}.W_q')
+    write_linear(f, W_k, b_k, label=f'{label}.W_k')
+    write_linear(f, W_v, b_v, label=f'{label}.W_v')
+    write_linear(f, W_o, b_o, label=f'{label}.W_o')
 
 def write_transformer_encoder_layer(f, tensors, layer_idx, config):
     d_model   = config['d_model']
@@ -369,10 +388,10 @@ def write_gpt2_model(f, tensors, config):
     write_tcapint(f, n_modules)
 
     # Token embedding
-    write_embedding(f, tensors['wte.weight'])
+    write_embedding(f, tensors['wte.weight'], label='wte')
 
     # Learned positional encoding
-    write_learned_positional_encoding(f, tensors['wpe.weight'])
+    write_learned_positional_encoding(f, tensors['wpe.weight'], label='wpe')
 
     # Transformer layers
     cfg = dict(config, arch='gpt2')
@@ -381,11 +400,11 @@ def write_gpt2_model(f, tensors, config):
 
     # Final layer norm
     write_layernorm(f, tensors['ln_f.weight'], tensors['ln_f.bias'],
-                    config.get('layer_norm_epsilon', 1e-5))
+                    config.get('layer_norm_epsilon', 1e-5), label='ln_f')
 
     # LM head (weight-tied to token embedding in standard GPT-2)
     lm_w = tensors.get('lm_head.weight', tensors['wte.weight'])
-    write_linear(f, lm_w, None)
+    write_linear(f, lm_w, None, label='lm_head')
 
 def write_bert_model(f, tensors, config):
     n_layer = config['num_hidden_layers']
@@ -500,15 +519,19 @@ def main():
     parser.add_argument('--arch', default='auto',
                         choices=['auto', 'gpt2', 'bert', 'qwen'],
                         help='Model architecture (default: auto-detect from config.json)')
-    parser.add_argument('--list_keys', action='store_true',
-                        help='List all tensor keys in the safetensors file and exit')
+    parser.add_argument('--debug', action='store_true',
+                        help='Print file offsets and shapes for every parameter written')
     args = parser.parse_args()
+
+    global DEBUG
+    if args.debug:
+        DEBUG = True
 
     model_dir = Path(args.model_dir)
 
     tensors = load_safetensors(model_dir)
 
-    if args.list_keys:
+    if hasattr(args, "list_keys"):
         for k, v in sorted(tensors.items()):
             print(f"  {k:60s} {str(v.shape):30s} {v.dtype}")
         return
