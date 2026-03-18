@@ -344,16 +344,43 @@ def normalise_config(raw, arch):
 # ---------------------------------------------------------------------------
 # Safetensors loader — returns dict of key → np.ndarray (float32)
 # ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# Safetensors loader — returns dict of key → np.ndarray (float32)
+# ---------------------------------------------------------------------------
 def load_safetensors(model_dir: Path):
-    st_files = sorted(model_dir.glob('*.safetensors'))
-    if not st_files:
-        raise FileNotFoundError(f"No .safetensors files found in {model_dir}")
+    # If a sharding index exists, use it to find the actual shard files.
+    index_path = model_dir / 'model.safetensors.index.jso'
+    if index_path.exists():
+        with open(index_path) as f:
+            index = json.load(f)
+        # weight_map: { tensor_name: shard_filename }
+        shard_files = sorted(set(index['weight_map'].values()))
+        st_files = [model_dir / s for s in shard_files]
+        print(f"Sharded model: {len(st_files)} shard(s) via index.")
+    else:
+        # Single-file or unindexed multi-file: load every .safetensors file
+        # that is NOT an index file (some tools emit foo.safetensors.index.json
+        # with a .safetensors extension by mistake).
+        st_files = sorted(
+            p for p in model_dir.glob('*.safetensors')
+            if 'index' not in p.name.lower()
+        )
+        if not st_files:
+            raise FileNotFoundError(f"No .safetensors files found in {model_dir}")
 
     tensors = {}
     for st_path in st_files:
-        with safe_open(str(st_path), framework='numpy') as f:
-            for key in f.keys():
-                tensors[key] = f.get_tensor(key).astype(np.float32)
+        print(f"  Loading {st_path.name} ...")
+        try:
+            with safe_open(str(st_path), framework='numpy') as f:
+                for key in f.keys():
+                    tensors[key] = f.get_tensor(key).astype(np.float32)
+        except Exception as e:
+            print(f"  WARNING: skipping {st_path.name}: {e}")
+            continue
+
+    if not tensors:
+        raise RuntimeError("No tensors loaded — check model directory contents.")
 
     print(f"Loaded {len(tensors)} tensors from {len(st_files)} safetensors file(s).")
     return tensors
