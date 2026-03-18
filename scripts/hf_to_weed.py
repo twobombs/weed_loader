@@ -108,10 +108,12 @@ def write_bool(f, x):            w_bool(f, x)
 # Sparse formats are not generated here (no equivalent in HF dense weights).
 # ---------------------------------------------------------------------------
 def write_storage(f, arr: np.ndarray):
-    arr = arr.astype(np.float32).flatten(order='C')
+    # Weed is column-major (Fortran order) — flatten accordingly.
+    arr = np.asfortranarray(arr.astype(np.float32))
+    flat = arr.flatten(order='F')
     w_uint32(f, StorageType.REAL_CPU_DENSE)  # stype
-    write_tcapint(f, arr.size)               # size (element count)
-    f.write(arr.tobytes())                   # raw float32 elements
+    write_tcapint(f, flat.size)              # size (element count)
+    f.write(flat.tobytes())                  # raw float32 elements, column-major
 
 # ---------------------------------------------------------------------------
 # Parameter writer
@@ -119,26 +121,29 @@ def write_storage(f, arr: np.ndarray):
 # Strides are C-contiguous (row-major).
 # ---------------------------------------------------------------------------
 def write_parameter(f, arr: np.ndarray, offset: int = 0):
-    shape = list(arr.shape)
+    # Weed uses column-major (Fortran) strides: stride[0]=1, stride[i]=prod(shape[:i])
+    # This matches the stride computation in forward_int exactly.
+    arr_f = np.asfortranarray(arr.astype(np.float32))
+    shape = list(arr_f.shape)
     ndim  = len(shape)
-    # Compute C-contiguous strides in elements
     strides = [1] * ndim
-    for i in range(ndim - 2, -1, -1):
-        strides[i] = strides[i + 1] * shape[i + 1]
+    for i in range(1, ndim):
+        strides[i] = strides[i - 1] * shape[i - 1]
 
     write_tcapint(f, offset)
     write_tcapint(f, ndim)
     for s, st in zip(shape, strides):
         write_tcapint(f, s)
         write_tcapint(f, st)
-    write_storage(f, arr)
+    write_storage(f, arr_f)
 
 # ---------------------------------------------------------------------------
 # Module writers — one function per ModuleType used in conversion
 # ---------------------------------------------------------------------------
 def write_linear(f, weight: np.ndarray, bias=None):
-    """weight shape: (out_features, in_features)"""
-    out_f, in_f = weight.shape
+    """weight from HF: (out_features, in_features) — Weed expects (in_features, out_features)."""
+    weight = weight.T   # (in_features, out_features)
+    in_f, out_f = weight.shape
     write_module_type(f, ModuleType.LINEAR_T)
     write_tcapint(f, in_f)
     write_tcapint(f, out_f)
@@ -201,9 +206,12 @@ def write_transformer_encoder_layer(f, tensors, layer_idx, config):
         c_proj_w = tensors[f'{pfx}.attn.c_proj.weight']
         c_proj_b = tensors.get(f'{pfx}.attn.c_proj.bias')
 
-        # GPT-2 stores weights transposed relative to PyTorch Linear convention
-        # c_attn_w: (d_model, 3*d_model) → split and transpose each
-        W_qkv = c_attn_w.T  # (3*d_model, d_model)
+        # GPT-2 uses Conv1D which stores weights as (in, out) natively.
+        # We transpose to (out, in) here to match standard HF Linear convention,
+        # then write_linear will transpose again to (in, out) for Weed.
+        # Net effect: two transposes = back to original (in, out) GPT-2 layout,
+        # which is what Weed expects.
+        W_qkv = c_attn_w.T  # (3*d_model, d_model) — now (out, in) HF convention
         W_q = W_qkv[:d_model, :]
         W_k = W_qkv[d_model:2*d_model, :]
         W_v = W_qkv[2*d_model:, :]
@@ -214,12 +222,12 @@ def write_transformer_encoder_layer(f, tensors, layer_idx, config):
             b_k = c_attn_b[d_model:2*d_model]
             b_v = c_attn_b[2*d_model:]
 
-        W_o = c_proj_w.T
+        W_o = c_proj_w.T   # (d_model, d_model) — now (out, in) HF convention
         b_o = c_proj_b
 
-        ff1_w = tensors[f'{pfx}.mlp.c_fc.weight'].T
+        ff1_w = tensors[f'{pfx}.mlp.c_fc.weight'].T    # (d_ff, d_model)
         ff1_b = tensors.get(f'{pfx}.mlp.c_fc.bias')
-        ff2_w = tensors[f'{pfx}.mlp.c_proj.weight'].T
+        ff2_w = tensors[f'{pfx}.mlp.c_proj.weight'].T  # (d_model, d_ff)
         ff2_b = tensors.get(f'{pfx}.mlp.c_proj.bias')
 
         ln1_g = tensors[f'{pfx}.ln_1.weight']
@@ -263,6 +271,90 @@ def write_transformer_encoder_layer(f, tensors, layer_idx, config):
     write_layernorm(f, ln1_g, ln1_b, ln_eps)
     write_layernorm(f, ln2_g, ln2_b, ln_eps)
     write_gelu(f)  # activation — adjust if arch uses ReLU etc.
+
+def write_qwen_transformer_layer(f, tensors, layer_idx, config):
+    """
+    Qwen2/Qwen3 decoder layer. Key differences from GPT-2/BERT:
+    - Separate q_proj, k_proj, v_proj (GQA: k/v heads may be fewer)
+    - SwiGLU FFN: gate_proj + up_proj → silu(gate) * up → down_proj
+    - RMSNorm instead of LayerNorm (no beta/bias — we write zeros)
+    - Rotary embeddings are baked into weights; no explicit pos encoding module
+    """
+    d_model      = config['d_model']
+    d_ff         = config['d_ff']
+    num_heads    = config['num_heads']
+    num_kv_heads = config['num_kv_heads']
+    eps          = config.get('layer_norm_eps', 1e-6)
+    pfx          = f'model.layers.{layer_idx}'
+
+    W_q = tensors[f'{pfx}.self_attn.q_proj.weight']
+    b_q = tensors.get(f'{pfx}.self_attn.q_proj.bias')
+    W_k = tensors[f'{pfx}.self_attn.k_proj.weight']
+    b_k = tensors.get(f'{pfx}.self_attn.k_proj.bias')
+    W_v = tensors[f'{pfx}.self_attn.v_proj.weight']
+    b_v = tensors.get(f'{pfx}.self_attn.v_proj.bias')
+    W_o = tensors[f'{pfx}.self_attn.o_proj.weight']
+    b_o = tensors.get(f'{pfx}.self_attn.o_proj.bias')
+
+    # SwiGLU: concatenate gate_proj and up_proj into ff1, use down_proj as ff2
+    gate_w = tensors[f'{pfx}.mlp.gate_proj.weight']   # (d_ff, d_model)
+    up_w   = tensors[f'{pfx}.mlp.up_proj.weight']     # (d_ff, d_model)
+    down_w = tensors[f'{pfx}.mlp.down_proj.weight']   # (d_model, d_ff)
+
+    # Stack gate and up into a single (2*d_ff, d_model) matrix for ff1.
+    # Weed's GELU activation is applied after ff1; the SwiGLU split can be
+    # handled at inference time if QrackNeuronLayer or a custom op is added.
+    # For now we store gate||up as ff1 and down as ff2 — flag for Weed-side handling.
+    ff1_w = np.concatenate([gate_w, up_w], axis=0)   # (2*d_ff, d_model)
+    ff1_b = None
+    ff2_w = down_w
+    ff2_b = tensors.get(f'{pfx}.mlp.down_proj.bias')
+
+    # RMSNorm: only gamma (weight), no beta. Write zeros for beta.
+    ln1_g = tensors[f'{pfx}.input_layernorm.weight']
+    ln1_b = np.zeros_like(ln1_g)
+    ln2_g = tensors[f'{pfx}.post_attention_layernorm.weight']
+    ln2_b = np.zeros_like(ln2_g)
+
+    write_module_type(f, ModuleType.TRANSFORMER_ENCODER_LAYER_T)
+    write_tcapint(f, d_model)
+    write_tcapint(f, d_ff * 2)   # ff1 is doubled for gate||up
+    write_tcapint(f, num_heads)
+    write_multihead_attention(f, W_q, b_q, W_k, b_k, W_v, b_v, W_o, b_o,
+                               d_model, num_heads)
+    write_linear(f, ff1_w, ff1_b)
+    write_linear(f, ff2_w, ff2_b)
+    write_layernorm(f, ln1_g, ln1_b, eps)
+    write_layernorm(f, ln2_g, ln2_b, eps)
+    write_gelu(f)   # placeholder activation; SwiGLU needs Weed-side support
+
+
+def write_qwen_model(f, tensors, config):
+    n_layer = config['n_layer']
+    d_model = config['d_model']
+    eps     = config.get('layer_norm_eps', 1e-6)
+
+    # Modules: embed_tokens + N layers + final norm + lm_head
+    n_modules = 1 + n_layer + 1 + 1
+    write_module_type(f, ModuleType.SEQUENTIAL_T)
+    write_tcapint(f, n_modules)
+
+    # Token embedding (no positional embedding — Qwen uses RoPE in attention)
+    write_embedding(f, tensors['model.embed_tokens.weight'])
+
+    # Decoder layers
+    for i in range(n_layer):
+        write_qwen_transformer_layer(f, tensors, i, config)
+
+    # Final RMSNorm
+    ln_g = tensors['model.norm.weight']
+    ln_b = np.zeros_like(ln_g)
+    write_layernorm(f, ln_g, ln_b, eps)
+
+    # LM head
+    lm_w = tensors.get('lm_head.weight', tensors['model.embed_tokens.weight'])
+    write_linear(f, lm_w, None)
+
 
 # ---------------------------------------------------------------------------
 # Top-level sequential model writers per architecture
@@ -338,18 +430,28 @@ def normalise_config(raw, arch):
             'num_heads':            raw['num_attention_heads'],
             'layer_norm_eps':       raw.get('layer_norm_eps', 1e-12),
         }
+    elif arch == 'qwen':
+        # Qwen2/Qwen3 config field names
+        return {
+            'arch':           'qwen',
+            'n_layer':        raw['num_hidden_layers'],
+            'd_model':        raw['hidden_size'],
+            'd_ff':           raw['intermediate_size'],
+            'num_heads':      raw['num_attention_heads'],
+            # Qwen uses grouped query attention — num_key_value_heads may differ
+            'num_kv_heads':   raw.get('num_key_value_heads',
+                                      raw['num_attention_heads']),
+            'layer_norm_eps': raw.get('rms_norm_eps', 1e-6),
+        }
     else:
         raise ValueError(f"Unsupported arch: {arch}")
 
 # ---------------------------------------------------------------------------
 # Safetensors loader — returns dict of key → np.ndarray (float32)
 # ---------------------------------------------------------------------------
-# ---------------------------------------------------------------------------
-# Safetensors loader — returns dict of key → np.ndarray (float32)
-# ---------------------------------------------------------------------------
 def load_safetensors(model_dir: Path):
     # If a sharding index exists, use it to find the actual shard files.
-    index_path = model_dir / 'model.safetensors.index.jso'
+    index_path = model_dir / 'model.safetensors.index.json'
     if index_path.exists():
         with open(index_path) as f:
             index = json.load(f)
@@ -396,7 +498,7 @@ def main():
     parser.add_argument('--output', default='model.weed',
                         help='Output filename (default: model.weed)')
     parser.add_argument('--arch', default='auto',
-                        choices=['auto', 'gpt2', 'bert'],
+                        choices=['auto', 'gpt2', 'bert', 'qwen'],
                         help='Model architecture (default: auto-detect from config.json)')
     parser.add_argument('--list_keys', action='store_true',
                         help='List all tensor keys in the safetensors file and exit')
@@ -426,9 +528,12 @@ def main():
             arch = 'gpt2'
         elif 'bert' in model_type:
             arch = 'bert'
+        elif 'qwen' in model_type:
+            arch = 'qwen'
         else:
             print(f"Could not auto-detect architecture from model_type='{model_type}'.")
-            print("Please specify --arch explicitly.")
+            print("Known types: gpt2, bert, qwen")
+            print("Use --list_keys to inspect tensor names and --arch to specify manually.")
             sys.exit(1)
 
     print(f"Architecture: {arch}")
@@ -441,6 +546,8 @@ def main():
             write_gpt2_model(f, tensors, config)
         elif arch == 'bert':
             write_bert_model(f, tensors, config)
+        elif arch == 'qwen':
+            write_qwen_model(f, tensors, config)
 
     size_mb = output_path.stat().st_size / (1024 * 1024)
     print(f"Written: {output_path}  ({size_mb:.1f} MB)")
