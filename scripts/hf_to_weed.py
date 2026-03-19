@@ -526,6 +526,8 @@ def load_safetensors(model_dir: Path):
 def main():
     parser = argparse.ArgumentParser(
         description='Convert HuggingFace safetensors model to Weed binary format.')
+    parser.add_argument('--list_keys', required=False, action='store_true',
+                        help='List tensor shapes and types')
     parser.add_argument('--model_dir', required=True,
                         help='Directory containing model.safetensors and config.json')
     parser.add_argument('--output', default='model.weed',
@@ -545,7 +547,7 @@ def main():
 
     tensors = load_safetensors(model_dir)
 
-    if hasattr(args, "list_keys"):
+    if args.list_keys:
         for k, v in sorted(tensors.items()):
             print(f"  {k:60s} {str(v.shape):30s} {v.dtype}")
         return
