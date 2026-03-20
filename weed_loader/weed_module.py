@@ -144,9 +144,9 @@ class WeedModule:
         Weed.weed_lib.train_step(
             self.mid,
             len(input_ids),
-            ctypes.cast(input_ids, ctypes.POINTER(ctypes.c_longlong)),
+            WeedModule._longlong_byref(input_ids),
             len(target_ids),
-            ctypes.cast(target_ids, ctypes.POINTER(ctypes.c_longlong)),
+            WeedModule._longlong_byref(target_ids),
             learning_rate
         )
         self._throw_if_error()
