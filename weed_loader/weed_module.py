@@ -133,20 +133,22 @@ class WeedModule:
 
         return WeedTensor(data, shape_ptr[:n], stride_ptr[:n], dtype_out, d_offset)
 
-    # Drafted by (Anthropic) Claude, improved by Dan Strano
+    # Drafted by (Anthropic) Claude, improved by Dan Strano (iteratively)
     def train_step(self, input_ids, target_ids, learning_rate):
         """
         Single fine-tuning step.
         input_ids: list[int] — token ids for input sequence
         target_ids: list[int] — token ids for targets (typically input shifted by 1)
         """
+        seq_len = len(input_ids)
 
         Weed.weed_lib.train_step(
             self.mid,
-            len(input_ids),
-            WeedModule._longlong_byref(input_ids),
-            len(target_ids),
-            WeedModule._longlong_byref(target_ids),
-            learning_rate
+            1,                                           # n: number of shape dims
+            WeedModule._ulonglong_byref([seq_len]),      # shape: [seq_len]
+            WeedModule._longlong_byref(input_ids),       # input_ids
+            len(target_ids),                             # n_target
+            WeedModule._longlong_byref(target_ids),      # target_ids
+            ctypes.c_double(learning_rate)               # learning_rate
         )
         self._throw_if_error()
