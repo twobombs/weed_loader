@@ -231,7 +231,7 @@ def write_multihead_attention(f, W_q, b_q, W_k, b_k, W_v, b_v, W_o, b_o,
     if has_rope:
         write_rope(f, **rope_params)
 
-def write_transformer_encoder_layer(f, tensors, layer_idx, config):
+def write_transformer_encoder_layer(f, tensors, layer_idx, config, mask_val):
     d_model   = config['d_model']
     d_ff      = config['d_ff']
     num_heads = config['num_heads']
@@ -304,14 +304,14 @@ def write_transformer_encoder_layer(f, tensors, layer_idx, config):
     write_tcapint(f, d_ff)
     write_tcapint(f, num_heads)
     write_multihead_attention(f, W_q, b_q, W_k, b_k, W_v, b_v, W_o, b_o,
-                               d_model, num_heads)
+                               d_model, num_heads, None, None, mask_val)
     write_linear(f, ff1_w, ff1_b)
     write_linear(f, ff2_w, ff2_b)
     write_layernorm(f, ln1_g, ln1_b, ln_eps)
     write_layernorm(f, ln2_g, ln2_b, ln_eps)
     write_gelu(f)  # activation — adjust if arch uses ReLU etc.
 
-def write_qwen_transformer_layer(f, tensors, layer_idx, config):
+def write_qwen_transformer_layer(f, tensors, layer_idx, config, mask_val):
     """
     Qwen2/Qwen3 decoder layer. Key differences from GPT-2/BERT:
     - Separate q_proj, k_proj, v_proj (GQA: k/v heads may be fewer)
@@ -326,6 +326,7 @@ def write_qwen_transformer_layer(f, tensors, layer_idx, config):
     eps          = config.get('layer_norm_eps', 1e-6)
     rope_base    = config.get('rope_theta', 10000.0)
     max_seq_len  = config.get('max_position_embeddings', 2048)
+    mask_val     = config.get('mask_val', -1e9)
     head_dim     = d_model // num_heads
     pfx          = f'model.layers.{layer_idx}'
 
@@ -350,7 +351,7 @@ def write_qwen_transformer_layer(f, tensors, layer_idx, config):
     write_tcapint(f, num_heads)
     write_tcapint(f, num_kv_heads)
     write_multihead_attention(f, W_q, b_q, W_k, b_k, W_v, b_v, W_o, b_o,
-                               d_model, num_heads)
+                               d_model, num_heads, None, None, mask_val)
     write_rope(f, head_dim, max_seq_len, rope_base)
     write_swiglu(f, gate_w, up_w, down_w, label=f'{pfx}.mlp')
     write_rmsnorm(f, ln1_g, eps, label=f'{pfx}.input_layernorm')
@@ -420,6 +421,7 @@ def write_qwen_model(f, tensors, config):
 def write_gpt2_model(f, tensors, config):
     n_layer   = config['n_layer']
     d_model   = config['d_model']
+    mask_val   = config['mask_val']
 
     # token_emb + reshape + pos_emb + N layers + final_ln + lm_head
     n_modules = 3 + n_layer + 2
@@ -439,7 +441,7 @@ def write_gpt2_model(f, tensors, config):
     # Transformer layers
     cfg = dict(config, arch='gpt2')
     for i in range(n_layer):
-        write_transformer_encoder_layer(f, tensors, i, cfg)
+        write_transformer_encoder_layer(f, tensors, i, cfg, mask_val)
 
     # Final layer norm
     write_layernorm(f, tensors['ln_f.weight'], tensors['ln_f.bias'],
@@ -452,6 +454,7 @@ def write_gpt2_model(f, tensors, config):
 def write_bert_model(f, tensors, config):
     n_layer = config['num_hidden_layers']
     d_model = config['hidden_size']
+    mask_val   = config['mask_val']
 
     n_modules = 3 + n_layer + 1  # word_emb + pos_emb + tok_type_emb + layers + pooler
     write_module_type(f, ModuleType.SEQUENTIAL_T)
@@ -473,10 +476,11 @@ def write_bert_model(f, tensors, config):
 # ---------------------------------------------------------------------------
 # Config normalisation — map HF config.json fields to unified keys
 # ---------------------------------------------------------------------------
-def normalise_config(raw, arch):
+def normalise_config(raw, arch, mask_val):
     if arch == 'gpt2':
         return {
             'arch':                 'gpt2',
+            'mask_val':             mask_val,
             'n_layer':              raw['n_layer'],
             'd_model':              raw['n_embd'],
             'd_ff':                 raw.get('n_inner') or 4 * raw['n_embd'],
@@ -486,6 +490,7 @@ def normalise_config(raw, arch):
     elif arch == 'bert':
         return {
             'arch':                 'bert',
+            'mask_val':             mask_val,
             'n_layer':              raw['num_hidden_layers'],
             'd_model':              raw['hidden_size'],
             'd_ff':                 raw['intermediate_size'],
@@ -495,6 +500,7 @@ def normalise_config(raw, arch):
     elif arch == 'qwen':
         return {
             'arch':                    'qwen',
+            'mask_val':                mask_val,
             'n_layer':                 raw['num_hidden_layers'],
             'd_model':                 raw['hidden_size'],
             'd_ff':                    raw['intermediate_size'],
@@ -607,7 +613,7 @@ def main():
             sys.exit(1)
 
     print(f"Architecture: {arch}")
-    config = normalise_config(raw_config, arch)
+    config = normalise_config(raw_config, arch, args.mask_val)
     print(f"Config: {json.dumps(config, indent=2)}")
 
     output_path = Path(args.output)
