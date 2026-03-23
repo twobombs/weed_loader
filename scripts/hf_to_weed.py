@@ -114,6 +114,7 @@ def write_storage(f, arr: np.ndarray):
     arr = np.asfortranarray(arr.astype(np.float32))
     flat = arr.flatten(order='F')
     w_uint32(f, StorageType.REAL_CPU_DENSE)  # stype
+    write_symint(f, -1)                      # device ID (GPU)
     write_tcapint(f, flat.size)              # size (element count)
     f.write(flat.tobytes())                  # raw float32 elements, column-major
 
