@@ -55,7 +55,7 @@ ifeq ($(WEED_PRESENT),)
 endif
 	mkdir -p weed/build
 ifeq ($(UNAME_S),Linux)
-	cd weed/build; $(CMAKE_L) -DWEED_TCAPPOW=6 -DWEED_CPP_STD=20 -DQRACK_INCLUDE="${CMAKE_SOURCE_DIR}/qrack/build" -DQRACK_DIR="${CMAKE_SOURCE_DIR}/qrack/build" ..; make weed_shared weed_cl_precompile
+	cd weed/build; $(CMAKE_L) -DWEED_TCAPPOW=6 -DWEED_CPP_STD=20 -DQRACK_INCLUDE="../qrack/build" -DQRACK_DIR="../qrack/build" ..; make weed_shared weed_cl_precompile
 endif
 ifeq ($(UNAME_S),Darwin)
 	cd weed/build; cmake -DWEED_ENABLE_OPENCL=OFF -DWEED_TCAPPOW=6 -DWEED_CPP_STD=20 ..; make weed_shared weed_cl_precompile
