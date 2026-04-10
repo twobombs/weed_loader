@@ -6,6 +6,13 @@ Minimalist AI/ML inference and backprogation in the style of [Qrack](https://git
 ## Weed Loader
 This repository is for the **Python loader** for (C++) Weed models. Once you have trained models in C++, you can load them for use by Python with this project. See the [Weed repository](https://github.com/vm6502q/weed) for more information.
 
+## Repository Structure
+- **`weed_loader/`**: The core Python package providing the API for interacting with Weed C++ modules (`WeedModule` and `WeedTensor`).
+- **`weed_loader/weed_system/`**: A low-level sub-package using `ctypes` to bridge Python to the compiled Weed C++ shared library.
+- **`scripts/`**: Utility scripts for fine-tuning, HuggingFace format conversion (`hf_to_weed.py`), and chat interfaces for models like GPT-2 and Qwen.
+
+Each directory contains its own `README.md` with further details on its inner workings and features.
+
 ## Development Status
 **Weed** is a rapidly-developing **work-in-progress**. Its ABI may change drastically and without notice.
 
